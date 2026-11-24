@@ -1,0 +1,140 @@
+pragma solidity ^0.8.13;
+
+interface IERC20 {
+  function balanceOf(address account) external view returns(uint256);
+  function transfer(address to, uint256 amount) external returns(bool);
+  function transferFrom(address from, address to, uint256 amount) external returns(bool);
+}
+
+contract Vault {
+
+  IERC20 public immutable token;
+  mapping(address => uint256) public balanceOf;
+
+  //权限控制
+  address public owner;
+  bool public paused;
+
+  //防止冲入控制变量
+  uint256 private constant _NOT_ENTERED = 1;
+  uint256 private constant _ENTERED = 2;
+  uint256 private _status;
+
+  event OwnershipTrasferred(address indexed previousOwner, address indexed newOwner);
+  event Paused(address indexed account);
+  event Unpaused(address indexed account);
+
+  event Deposit(address indexed user, uint256 amount);
+  event Withdraw(address indexed user, uint256 amount);
+
+  error Unauthorized();
+  error EnforcedPause();
+  error ExpectedPause();
+  error ReentrancyGuardReentrantCall();
+
+  error Insufficient(uint256 available, uint256 required);
+  error ZeroAddress();
+  error ZeroAmount();
+  error TransferFailed();
+
+  /// @notice 权限控制：仅管理员可用
+  modifier onlyOwner() {
+    if (msg.sender != owner)  revert Unauthorized();
+    _;
+  }
+
+  /// @notice 暂停控制：未暂停时才可用
+  modifier whenNotPaused() {
+    if (paused) revert EnforcedPause();
+    _;
+  }
+
+  /// @notice 暂停控制：暂停时才可用
+  modifier whenPaused() {
+    if (!paused) revert ExpectedPause();
+    _;
+  }
+  
+  /// @notice 防重入控制：执行期间加锁，防止重复进入
+  modifier nonReentrant() {
+    if (_status == _ENTERED) revert ReentrancyGuardReentrantCall();
+    _status = _ENTERED;
+    _;
+    _status = _NOT_ENTERED;
+  }
+  
+  
+  constructor(IERC20 _token) {
+    if (address(_token) == address(0)) {
+      revert ZeroAddress();
+    }
+    token = _token;
+    owner = msg.sender;
+    _status = _NOT_ENTERED;
+
+    emit OwnershipTrasferred(address(0), msg.sender);
+  }
+
+  function pause() external onlyOwner whenNotPaused {
+    paused = true;
+    emit Paused(msg.sender);
+  }
+
+  function unpause() external onlyOwner whenPaused {
+    paused = false;
+    emit Unpaused(msg.sender);
+  }
+
+  function transferOwnership(address newOwner) external onlyOwner {
+    if (newOwner == address(0)) revert ZeroAddress();
+    emit OwnershipTrasferred(owner, newOwner);
+    owner = newOwner;
+  }
+
+  function deposit(uint256 amount) external nonReentrant whenNotPaused {
+    if (amount == 0) {
+      revert ZeroAmount();
+    }
+      
+    uint256 actualAmount = token.balanceOf(msg.sender);
+    if (actualAmount < amount) {
+      revert Insufficient(actualAmount, amount);
+    }
+    balanceOf[msg.sender] += amount;
+    emit Deposit(msg.sender, amount);
+
+    _safeTransferFrom(msg.sender, address(this), amount);
+  }
+
+  function withdraw(uint256 amount) external nonReentrant whenNotPaused {
+    if (amount == 0) {
+      revert ZeroAmount();
+    } 
+
+    uint256 balance = balanceOf[msg.sender];
+    if (balance < amount) {
+      revert Insufficient(balance, amount);
+    }
+      
+    balanceOf[msg.sender] = balance - amount;
+    emit Withdraw(msg.sender, amount);
+
+    _safeTransfer(msg.sender, amount);
+  }
+
+  function _safeTransfer(address to, uint256 amount) internal {
+    (bool success, bytes memory data) = address(token).call(
+      abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    if (!success || (data.length != 0 && !abi.decode(data, (bool)))) {
+      revert TransferFailed();
+    }
+  }
+
+  function _safeTransferFrom(address from, address to, uint256 amount) internal {
+    (bool success, bytes memory data) = address(token).call(
+      abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+    if (!success || (data.length != 0 && !abi.decode(data, (bool)))) {
+      revert TransferFailed();
+    }
+  }
+}
