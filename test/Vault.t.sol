@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test, console} from "forge-std/Test.sol";
-import {Vault, IERC20} from "../src/Vault.sol";
+import {Vault, IERC20, IAave} from "../src/Vault.sol";
 import {VaultFactory} from "../src/VaultFactory.sol";
 import {MyToken} from "../src/MyToken.sol";
 
@@ -12,6 +12,8 @@ contract MaliciousReentrantToken is IERC20 {
     mapping(address => uint256) public override balanceOf;
     bool public hasAttacked;
     bool public attackSuccess;
+
+    mapping(address => mapping(address => uint256)) public allowance;
 
     function setVault(Vault _vault) external {
         vault = _vault;
@@ -45,12 +47,56 @@ contract MaliciousReentrantToken is IERC20 {
         balanceOf[to] += amount;
         return true;
     }
+
+    function approve(address account, uint256 amount) external override returns (bool) {
+        if (account == address(0)) return false;
+        allowance[msg.sender][account] = amount;
+        return true;
+    }
+}
+
+/// @notice 模拟 Aave 资金池合约，用于测试金库投资、赎回及迁移逻辑
+contract MockAavePool is IAave {
+    IERC20 public token;
+    mapping(address => uint256) public deposits;
+
+    constructor(IERC20 _token) {
+        token = _token;
+    }
+
+    function supply(
+        address asset,
+        uint256 amount,
+        address onBehalfOf,
+        uint16 /*referralCode*/
+    ) external override {
+        require(asset == address(token), "Invalid asset");
+        token.transferFrom(msg.sender, address(this), amount);
+        deposits[onBehalfOf] += amount;
+    }
+
+    function withdraw(
+        address asset,
+        uint256 amount,
+        address to
+    ) external override {
+        require(asset == address(token), "Invalid asset");
+        uint256 userDeposit = deposits[msg.sender];
+        uint256 withdrawAmount = amount;
+        if (amount == type(uint256).max) {
+            withdrawAmount = userDeposit;
+        }
+        require(userDeposit >= withdrawAmount, "Aave: insufficient balance");
+        deposits[msg.sender] -= withdrawAmount;
+        token.transfer(to, withdrawAmount);
+    }
 }
 
 contract VaultTest is Test {
     Vault public vault;
     VaultFactory public factory;
     MyToken public token;
+    MockAavePool public aavePool;
 
     address public owner = makeAddr("owner");
     address public alice = makeAddr("alice");
@@ -67,6 +113,7 @@ contract VaultTest is Test {
     event Paused(address indexed account);
     event Unpaused(address indexed account);
     event VaultCreated(address indexed token, address indexed valutAddress);
+    event UpdateAavePool(address indexed oldAavePool, address indexed newAavePool);
 
     function setUp() public {
         vm.startPrank(owner);
@@ -80,7 +127,10 @@ contract VaultTest is Test {
         // 3. 部署工厂合约
         factory = new VaultFactory();
 
-        // 4. 分发代币给测试用户 Alice 和 Bob
+        // 4. 部署模拟 Aave 资金池
+        aavePool = new MockAavePool(IERC20(address(token)));
+
+        // 5. 分发代币给测试用户 Alice 和 Bob
         token.transfer(alice, ALICE_MINT_AMOUNT);
         token.transfer(bob, BOB_MINT_AMOUNT);
         vm.stopPrank();
@@ -94,6 +144,7 @@ contract VaultTest is Test {
         assertEq(address(vault.token()), address(token));
         assertEq(vault.owner(), owner);
         assertFalse(vault.paused());
+        assertEq(vault.aavePool(), address(0));
     }
 
     function test_Initialize_Emit_OwnershipTransferred() public {
@@ -110,6 +161,12 @@ contract VaultTest is Test {
         // 重复调用 initialize 应当被拦截
         vm.expectRevert(Vault.AlreadyInitialize.selector);
         vault.initialize(IERC20(address(token)), alice);
+    }
+
+    function test_Initialize_RevertWhen_ZeroAddressOwner() public {
+        Vault freshVault = new Vault();
+        vm.expectRevert(Vault.ZeroAddress.selector);
+        freshVault.initialize(IERC20(address(token)), address(0));
     }
 
     // =============================================================
@@ -189,7 +246,7 @@ contract VaultTest is Test {
     }
 
     // =============================================================
-    // 3. 提取 (Withdraw) 测试
+    // 3. 提取 (Withdraw) 测试（金库现钞充足场景）
     // =============================================================
 
     function test_Withdraw_PartialSuccess() public {
@@ -519,6 +576,200 @@ contract VaultTest is Test {
         assertEq(clonedVault.balanceOf(alice), 0);
         assertEq(token.balanceOf(vaultAddr), 0);
         assertEq(token.balanceOf(alice), ALICE_MINT_AMOUNT);
+        vm.stopPrank();
+    }
+
+    // =============================================================
+    // 9. Aave 借贷池配置与迁移测试 (migrateAavePool)
+    // =============================================================
+
+    function test_MigrateAavePool_Success() public {
+        vm.startPrank(owner);
+        vm.expectEmit(true, true, false, false, address(vault));
+        emit UpdateAavePool(address(0), address(aavePool));
+
+        vault.migrateAavePool(address(aavePool));
+        assertEq(vault.aavePool(), address(aavePool));
+        vm.stopPrank();
+    }
+
+    function test_MigrateAavePool_RevertWhen_NotOwner() public {
+        vm.startPrank(alice);
+        vm.expectRevert(Vault.Unauthorized.selector);
+        vault.migrateAavePool(address(aavePool));
+        vm.stopPrank();
+    }
+
+    function test_MigrateAavePool_RevertWhen_ZeroAddress() public {
+        vm.startPrank(owner);
+        vm.expectRevert(Vault.ZeroAddress.selector);
+        vault.migrateAavePool(address(0));
+        vm.stopPrank();
+    }
+
+    function test_MigrateAavePool_RevertWhen_SameAddress() public {
+        vm.startPrank(owner);
+        vault.migrateAavePool(address(aavePool));
+
+        // 尝试重复迁移到相同地址
+        vm.expectRevert(Vault.SameAddress.selector);
+        vault.migrateAavePool(address(aavePool));
+        vm.stopPrank();
+    }
+
+    function test_MigrateAavePool_Withdraws_All_Funds_From_Old_Pool() public {
+        // 场景准备：金库在旧池中已存入资金
+        vm.startPrank(owner);
+        vault.migrateAavePool(address(aavePool));
+        vm.stopPrank();
+
+        uint256 depositAmount = 500 * 10 ** 18;
+        vm.startPrank(alice);
+        token.approve(address(vault), depositAmount);
+        vault.deposit(depositAmount);
+        vm.stopPrank();
+
+        // 管理员将 400 枚存入 Aave
+        uint256 investAmount = 400 * 10 ** 18;
+        vm.prank(owner);
+        vault.investToAave(investAmount);
+
+        assertEq(token.balanceOf(address(vault)), 100 * 10 ** 18);
+        assertEq(aavePool.deposits(address(vault)), investAmount);
+
+        // 部署新池并执行迁移
+        MockAavePool newAavePool = new MockAavePool(IERC20(address(token)));
+        vm.prank(owner);
+        vault.migrateAavePool(address(newAavePool));
+
+        // 验证：旧池资金已被全部取回金库，金库现金恢复为 500 枚
+        assertEq(aavePool.deposits(address(vault)), 0);
+        assertEq(token.balanceOf(address(vault)), depositAmount);
+        assertEq(vault.aavePool(), address(newAavePool));
+        // 验证对旧池的授权已被解除 (approve = 0)
+        assertEq(token.allowance(address(vault), address(aavePool)), 0);
+    }
+
+    // =============================================================
+    // 10. Aave 投资测试 (investToAave)
+    // =============================================================
+
+    function test_InvestToAave_Success() public {
+        // 配置 Aave 池
+        vm.prank(owner);
+        vault.migrateAavePool(address(aavePool));
+
+        // Alice 存入 300 枚
+        uint256 depositAmount = 300 * 10 ** 18;
+        vm.startPrank(alice);
+        token.approve(address(vault), depositAmount);
+        vault.deposit(depositAmount);
+        vm.stopPrank();
+
+        // 管理员将其中 200 枚转入 Aave 生息
+        uint256 investAmount = 200 * 10 ** 18;
+        vm.prank(owner);
+        vault.investToAave(investAmount);
+
+        // 验证：金库留存现金 100 枚，Aave 记账 200 枚
+        assertEq(token.balanceOf(address(vault)), depositAmount - investAmount);
+        assertEq(aavePool.deposits(address(vault)), investAmount);
+    }
+
+    function test_InvestToAave_RevertWhen_NotOwner() public {
+        vm.startPrank(alice);
+        vm.expectRevert(Vault.Unauthorized.selector);
+        vault.investToAave(100 * 10 ** 18);
+        vm.stopPrank();
+    }
+
+    function test_InvestToAave_RevertWhen_ZeroAmount() public {
+        vm.startPrank(owner);
+        vault.migrateAavePool(address(aavePool));
+
+        vm.expectRevert(Vault.ZeroAmount.selector);
+        vault.investToAave(0);
+        vm.stopPrank();
+    }
+
+    function test_InvestToAave_RevertWhen_ZeroAddressPool() public {
+        // 未配置 aavePool (默认为 0 地址) 时尝试投资
+        vm.startPrank(owner);
+        vm.expectRevert(Vault.ZeroAddress.selector);
+        vault.investToAave(100 * 10 ** 18);
+        vm.stopPrank();
+    }
+
+    function test_InvestToAave_RevertWhen_InsufficientVaultBalance() public {
+        vm.startPrank(owner);
+        vault.migrateAavePool(address(aavePool));
+
+        // 金库当前余额为 0，尝试投资 100 枚
+        vm.expectRevert(
+            abi.encodeWithSelector(Vault.Insufficient.selector, 0, 100 * 10 ** 18)
+        );
+        vault.investToAave(100 * 10 ** 18);
+        vm.stopPrank();
+    }
+
+    // =============================================================
+    // 11. 带 Aave 自动回款的提取测试 (Withdraw with Aave replenishment)
+    // =============================================================
+
+    function test_Withdraw_With_Aave_Replenishment_Success() public {
+        // 场景：Alice 存入 1000 枚，金库把 800 枚存入 Aave，手头仅剩 200 现金
+        vm.prank(owner);
+        vault.migrateAavePool(address(aavePool));
+
+        uint256 depositAmount = 1000 * 10 ** 18;
+        vm.startPrank(alice);
+        token.approve(address(vault), depositAmount);
+        vault.deposit(depositAmount);
+        vm.stopPrank();
+
+        uint256 investAmount = 800 * 10 ** 18;
+        vm.prank(owner);
+        vault.investToAave(investAmount);
+
+        assertEq(token.balanceOf(address(vault)), 200 * 10 ** 18);
+        assertEq(aavePool.deposits(address(vault)), 800 * 10 ** 18);
+
+        // Alice 提取 600 枚（手头现金 200 不足，需要自动从 Aave 赎回 400 枚）
+        uint256 withdrawAmount = 600 * 10 ** 18;
+        vm.startPrank(alice);
+        vault.withdraw(withdrawAmount);
+        vm.stopPrank();
+
+        // 验证 Alice 收到完整的 600 枚
+        assertEq(token.balanceOf(alice), ALICE_MINT_AMOUNT - depositAmount + withdrawAmount);
+        // 验证 Alice 金库剩余记账 400 枚
+        assertEq(vault.balanceOf(alice), depositAmount - withdrawAmount);
+        // 验证 Aave 剩余存款扣减为 400 枚
+        assertEq(aavePool.deposits(address(vault)), 400 * 10 ** 18);
+        // 验证金库手头现金刚好清零
+        assertEq(token.balanceOf(address(vault)), 0);
+    }
+
+    function test_Withdraw_RevertWhen_Liquid_Insufficient_And_No_AavePool() public {
+        // 场景：金库现存现金不足，且 aavePool 为 0 地址时尝试提取触发 ZeroAddress 回滚
+        // 1. Alice 存入 100 枚
+        vm.startPrank(alice);
+        token.approve(address(vault), 100 * 10 ** 18);
+        vault.deposit(100 * 10 ** 18);
+        vm.stopPrank();
+
+        // 模拟极端异常：金库内部现金被非正常划转或不足（直接转走部分现金）
+        // 这里通过 prank 模拟金库现存现金只有 20 枚（不足以支付 100 枚）
+        vm.prank(address(vault));
+        token.transfer(bob, 80 * 10 ** 18);
+
+        assertEq(token.balanceOf(address(vault)), 20 * 10 ** 18);
+        assertEq(vault.aavePool(), address(0));
+
+        // Alice 尝试提取 100 枚，因现金不足且 aavePool 为 0 地址，预期 revert ZeroAddress()
+        vm.startPrank(alice);
+        vm.expectRevert(Vault.ZeroAddress.selector);
+        vault.withdraw(100 * 10 ** 18);
         vm.stopPrank();
     }
 }

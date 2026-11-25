@@ -4,6 +4,22 @@ interface IERC20 {
   function balanceOf(address account) external view returns(uint256);
   function transfer(address to, uint256 amount) external returns(bool);
   function transferFrom(address from, address to, uint256 amount) external returns(bool);
+  function approve(address account, uint256 amount) external returns (bool);
+}
+
+interface IAave {
+  function supply(
+    address asset,
+    uint256 amount,
+    address onBehalfOf,
+    uint16  referralCode
+  ) external;
+
+  function withdraw(
+    address asset,
+    uint256 amount,
+    address to
+  ) external;
 }
 
 contract Vault {
@@ -20,12 +36,17 @@ contract Vault {
   uint256 private constant _ENTERED = 2;
   uint256 private _status;
 
+
+  // 投资或者生息的合约地址
+  address public aavePool;
+
   event OwnershipTrasferred(address indexed previousOwner, address indexed newOwner);
   event Paused(address indexed account);
   event Unpaused(address indexed account);
 
   event Deposit(address indexed user, uint256 amount);
   event Withdraw(address indexed user, uint256 amount);
+  event UpdateAavePool(address indexed oldAavePool, address indexed newAavePool);
 
   error Unauthorized();
   error EnforcedPause();
@@ -35,6 +56,7 @@ contract Vault {
 
   error Insufficient(uint256 available, uint256 required);
   error ZeroAddress();
+  error SameAddress();
   error ZeroAmount();
   error TransferFailed();
 
@@ -116,11 +138,60 @@ contract Vault {
     if (balance < amount) {
       revert Insufficient(balance, amount);
     }
-      
+    // 1. 
     balanceOf[msg.sender] = balance - amount;
     emit Withdraw(msg.sender, amount);
 
+    // 2. 检查手头资金够不够
+    uint256 liquidBalance = token.balanceOf(address(this));
+    if (liquidBalance < amount) {
+      uint256 delta = amount - liquidBalance;
+      if (address(0) == aavePool) {
+        revert ZeroAddress();
+      }
+      // 3. 从aave取回资金
+      IAave(aavePool).withdraw(address(token), delta, address(this));
+    }
+
     _safeTransfer(msg.sender, amount);
+  }
+
+  function migrateAavePool(address newAavePool) external onlyOwner {
+    if (address(0) == newAavePool) {
+      revert ZeroAddress();
+    }
+    if (newAavePool == aavePool) {
+      revert SameAddress();
+    }
+    if (address(0) != aavePool) {
+      // 从旧策略中取出所有的资金
+      IAave(aavePool).withdraw(address(token), type(uint256).max, address(this));
+      // 取出钱之后，解除授权
+      token.approve(aavePool, 0);
+    }
+    emit UpdateAavePool(aavePool, newAavePool);
+    aavePool = newAavePool;
+  }
+
+  function investToAave(uint256 amount) external onlyOwner {
+    if (amount == 0) {
+      revert ZeroAmount();
+    }
+
+    if (address(0) == aavePool) {
+      revert ZeroAddress();
+    }
+    
+    uint256 actualAmount = token.balanceOf(address(this));
+    if (actualAmount < amount) {
+      revert Insufficient(actualAmount, amount);
+    }
+    
+    //1 金库授权Aave合约，允许转移amount的token代币
+    token.approve(aavePool, amount);
+
+    //2 把金库的代币转给aave
+    IAave(aavePool).supply(address(token), amount, address(this), 0);
   }
 
   function _safeTransfer(address to, uint256 amount) internal {
