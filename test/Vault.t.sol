@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test, console} from "forge-std/Test.sol";
 import {Vault, IERC20} from "../src/Vault.sol";
+import {VaultFactory} from "../src/VaultFactory.sol";
 import {MyToken} from "../src/MyToken.sol";
 
 /// @notice 用于测试防重入的恶意代币合约
@@ -48,6 +49,7 @@ contract MaliciousReentrantToken is IERC20 {
 
 contract VaultTest is Test {
     Vault public vault;
+    VaultFactory public factory;
     MyToken public token;
 
     address public owner = makeAddr("owner");
@@ -64,34 +66,50 @@ contract VaultTest is Test {
     event OwnershipTrasferred(address indexed previousOwner, address indexed newOwner);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
+    event VaultCreated(address indexed token, address indexed valutAddress);
 
     function setUp() public {
         vm.startPrank(owner);
         // 1. 部署代币合约：初始给 owner 铸造 1,000,000 枚
         token = new MyToken("Test Token", "TT", INITIAL_SUPPLY);
 
-        // 2. 部署 Vault 保险库合约，传入代币地址
-        vault = new Vault(IERC20(address(token)));
+        // 2. 部署 Vault 保险库合约并调用 initialize 初始化
+        vault = new Vault();
+        vault.initialize(IERC20(address(token)), owner);
 
-        // 3. 分发代币给测试用户 Alice 和 Bob
+        // 3. 部署工厂合约
+        factory = new VaultFactory();
+
+        // 4. 分发代币给测试用户 Alice 和 Bob
         token.transfer(alice, ALICE_MINT_AMOUNT);
         token.transfer(bob, BOB_MINT_AMOUNT);
         vm.stopPrank();
     }
 
     // =============================================================
-    // 1. 构造函数测试
+    // 1. 初始化函数 (initialize) 测试
     // =============================================================
 
-    function test_Constructor_RevertWhen_ZeroAddress() public {
-        vm.expectRevert(Vault.ZeroAddress.selector);
-        new Vault(IERC20(address(0)));
-    }
-
-    function test_Constructor_Success() public view {
+    function test_Initialize_Success() public view {
         assertEq(address(vault.token()), address(token));
         assertEq(vault.owner(), owner);
         assertFalse(vault.paused());
+    }
+
+    function test_Initialize_Emit_OwnershipTransferred() public {
+        Vault freshVault = new Vault();
+        vm.expectEmit(true, true, false, true, address(freshVault));
+        emit OwnershipTrasferred(address(0), alice);
+        freshVault.initialize(IERC20(address(token)), alice);
+
+        assertEq(freshVault.owner(), alice);
+        assertEq(address(freshVault.token()), address(token));
+    }
+
+    function test_Initialize_RevertWhen_AlreadyInitialized() public {
+        // 重复调用 initialize 应当被拦截
+        vm.expectRevert(Vault.AlreadyInitialize.selector);
+        vault.initialize(IERC20(address(token)), alice);
     }
 
     // =============================================================
@@ -415,7 +433,8 @@ contract VaultTest is Test {
     function test_ReentrancyGuard_BlocksAttack() public {
         // 部署恶意重入代币
         MaliciousReentrantToken attackToken = new MaliciousReentrantToken();
-        Vault attackVault = new Vault(IERC20(address(attackToken)));
+        Vault attackVault = new Vault();
+        attackVault.initialize(IERC20(address(attackToken)), address(this));
         attackToken.setVault(attackVault);
 
         // 给 Alice 铸造代币
@@ -434,5 +453,72 @@ contract VaultTest is Test {
 
         // 确认恶意代币未能完成重入攻击
         assertFalse(attackToken.attackSuccess());
+    }
+
+    // =============================================================
+    // 8. 金库工厂合约测试 (VaultFactory & EIP-1167 Clone)
+    // =============================================================
+
+    function test_Factory_CreateVault_Success() public {
+        vm.startPrank(owner);
+        vm.expectEmit(true, false, false, false, address(factory));
+        emit VaultCreated(address(token), address(0));
+
+        address vaultAddr = factory.createVault(address(token));
+        assertEq(factory.getVault(address(token)), vaultAddr);
+        assertEq(factory.getAllVaults(), 1);
+
+        // 验证克隆出的金库属性是否正确初始化
+        Vault clonedVault = Vault(vaultAddr);
+        assertEq(address(clonedVault.token()), address(token));
+        assertEq(clonedVault.owner(), owner);
+        assertFalse(clonedVault.paused());
+        vm.stopPrank();
+    }
+
+    function test_Factory_CreateVault_RevertWhen_NotOwner() public {
+        vm.startPrank(alice);
+        vm.expectRevert(VaultFactory.Unauthorized.selector);
+        factory.createVault(address(token));
+        vm.stopPrank();
+    }
+
+    function test_Factory_CreateVault_RevertWhen_ZeroAddress() public {
+        vm.startPrank(owner);
+        vm.expectRevert(VaultFactory.ZeroAddress.selector);
+        factory.createVault(address(0));
+        vm.stopPrank();
+    }
+
+    function test_Factory_CreateVault_RevertWhen_AlreadyExists() public {
+        vm.startPrank(owner);
+        address firstVault = factory.createVault(address(token));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(VaultFactory.VaultAlreadyExists.selector, address(token), firstVault)
+        );
+        factory.createVault(address(token));
+        vm.stopPrank();
+    }
+
+    function test_Factory_ClonedVault_DepositAndWithdraw() public {
+        // 验证通过工厂克隆部署的金库，能够正常接收存款与提取
+        vm.prank(owner);
+        address vaultAddr = factory.createVault(address(token));
+        Vault clonedVault = Vault(vaultAddr);
+
+        uint256 depositAmount = 50 * 10 ** 18;
+        vm.startPrank(alice);
+        token.approve(vaultAddr, depositAmount);
+        clonedVault.deposit(depositAmount);
+
+        assertEq(clonedVault.balanceOf(alice), depositAmount);
+        assertEq(token.balanceOf(vaultAddr), depositAmount);
+
+        clonedVault.withdraw(depositAmount);
+        assertEq(clonedVault.balanceOf(alice), 0);
+        assertEq(token.balanceOf(vaultAddr), 0);
+        assertEq(token.balanceOf(alice), ALICE_MINT_AMOUNT);
+        vm.stopPrank();
     }
 }

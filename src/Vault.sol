@@ -8,7 +8,7 @@ interface IERC20 {
 
 contract Vault {
 
-  IERC20 public immutable token;
+  IERC20 public token;
   mapping(address => uint256) public balanceOf;
 
   //权限控制
@@ -31,6 +31,7 @@ contract Vault {
   error EnforcedPause();
   error ExpectedPause();
   error ReentrancyGuardReentrantCall();
+  error AlreadyInitialize();
 
   error Insufficient(uint256 available, uint256 required);
   error ZeroAddress();
@@ -63,16 +64,16 @@ contract Vault {
     _status = _NOT_ENTERED;
   }
   
-  
-  constructor(IERC20 _token) {
-    if (address(_token) == address(0)) {
+  function initialize(IERC20 _token, address _owner) external {
+    if (address(0) != owner) {
+      revert AlreadyInitialize();   
+    }
+    if (address(0) == _owner) {
       revert ZeroAddress();
     }
     token = _token;
-    owner = msg.sender;
-    _status = _NOT_ENTERED;
-
-    emit OwnershipTrasferred(address(0), msg.sender);
+    owner = _owner;
+    emit OwnershipTrasferred(address(0), owner);
   }
 
   function pause() external onlyOwner whenNotPaused {
